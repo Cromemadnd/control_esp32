@@ -1,0 +1,32 @@
+@keyframes pulse-slow {
+
+    0%,
+    100% {
+        opacity: 1;
+    }
+
+    50% {
+        opacity: 0.5;
+    }
+}
+
+.animate-pulse-slow {
+    animation: pulse-slow 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* 自定义滑动条样式 */
+input[type=range]::-webkit-slider-runnable-track {
+    background: #334155;
+    border-radius: 10px;
+    height: 8px;
+}
+
+input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    height: 20px;
+    width: 20px;
+    border-radius: 50%;
+    background: #38bdf8;
+    cursor: pointer;
+    margin-top: -6px;
+}
