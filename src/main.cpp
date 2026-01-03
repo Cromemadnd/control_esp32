@@ -121,10 +121,63 @@ void setup()
                     { request->send(404, "text/plain", "Not found"); });
 
   server.begin();
+
+  // Initialize Serial2 for STM32 Communication
+  // RX: 16, TX: 17, 115200 bps
+  Serial2.begin(115200, SERIAL_8N1, 16, 17);
 }
 
 void loop()
 {
   // Clean up disconnected WebSocket clients periodically
   ws.cleanupClients();
+
+  // UART Parsing
+  static uint8_t rx_buffer[32];
+  static int rx_idx = 0;
+
+  while (Serial2.available())
+  {
+    uint8_t c = Serial2.read();
+
+    if (rx_idx == 0) {
+      if (c == 0xAA) {
+          rx_buffer[rx_idx++] = c;
+      }
+    } 
+    else if (rx_idx == 1) {
+      if (c == 0x55) rx_buffer[rx_idx++] = c;
+      else rx_idx = 0; // Reset if header invalid
+    } 
+    else {
+      rx_buffer[rx_idx++] = c;
+      
+      // Full Packet Received: 2 Header + 20 Data + 1 Checksum = 23 bytes
+      if (rx_idx >= 23) {
+        // Validation
+        uint8_t checksum = 0;
+        // Data is from index 2 to 21 (20 bytes)
+        for (int i = 2; i < 22; i++) {
+          checksum += rx_buffer[i];
+        }
+
+        if (checksum == rx_buffer[22]) {
+           // Parse
+           float *values = (float*)&rx_buffer[2];
+
+           StaticJsonDocument<512> doc;
+           doc["voltage"]     = values[0];
+           doc["ac_voltage"]  = values[1];
+           doc["temperature"] = values[2];
+           doc["battery"]     = values[3];
+           doc["current"]     = values[4];
+           
+           // Broadcast to Web UI
+           broadcastJson(doc);
+        }
+
+        rx_idx = 0; // Reset for next packet
+      }
+    }
+  }
 }
