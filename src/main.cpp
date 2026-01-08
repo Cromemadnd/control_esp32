@@ -18,6 +18,8 @@ constexpr const char *kApPassword = "portablepower123";
 #define LED_COUNT 55      // LED 灯珠数量，根据实际灯条修改
 #define LED_BRIGHTNESS 50 // 初始亮度 (0-255)
 #define AC_RELAY_PIN 14   // 交流输出继电器控制引脚
+#define VOICE_RX_PIN 4    // 语音模块 RX 引脚 (ESP32 的 RX，接模块的 TX)
+
 
 CRGB leds[LED_COUNT];
 
@@ -295,6 +297,12 @@ void setup()
   // RX: 16, TX: 17, 115200 bps
   Serial2.begin(115200, SERIAL_8N1, 16, 17);
 
+  // 初始化语音模块串口 (Serial1)
+  // RX: 4, TX: -1 (不使用), 波特率通常为 9600 (请根据模块实际情况调整)
+  Serial1.begin(9600, SERIAL_8N1, VOICE_RX_PIN, -1);
+  Serial.println("Voice Module Serial1 initialized on Pin 4");
+
+
   // Initialize I2C and OLED Display
   Serial.println("Initializing OLED display...");
   Wire.begin();          // Explicitly init I2C (SDA=21, SCL=22 by default)
@@ -455,6 +463,61 @@ void loop()
 
         rx_idx = 0; // Reset for next packet
       }
+    }
+  }
+
+  // -------------------------
+  // 语音模块数据处理
+  // 协议: 头(FF 1F) + 指令 + 校验/数据
+  // 开灯: FF 1F 34 AA
+  // 关灯: FF 1F 34 BB
+  // -------------------------
+  while (Serial1.available())
+  {
+    static uint8_t voice_rx_buffer[4];
+    static int voice_rx_idx = 0;
+    
+    uint8_t c = Serial1.read();
+
+    // 简单的协议检测状态机
+    if (voice_rx_idx == 0) {
+      if (c == 0xFF) {
+        voice_rx_buffer[voice_rx_idx++] = c;
+      }
+    }
+    else if (voice_rx_idx == 1) {
+      if (c == 0x1F) {
+        voice_rx_buffer[voice_rx_idx++] = c;
+      } else {
+        voice_rx_idx = 0; 
+        if (c == 0xFF) voice_rx_idx = 1; 
+      }
+    }
+    else if (voice_rx_idx == 2) {
+      if (c == 0x34) {
+        voice_rx_buffer[voice_rx_idx++] = c;
+      } else {
+         voice_rx_idx = 0;
+      }
+    }
+    else if (voice_rx_idx == 3) {
+      voice_rx_buffer[voice_rx_idx] = c;
+      
+      // 检测指令
+      if (c == 0xAA) {
+        Serial.println("Voice Command: LIGHT ON");
+        // digitalWrite(AC_RELAY_PIN, HIGH);
+        FastLED.setBrightness(255);
+        FastLED.show();
+      }
+      else if (c == 0xBB) {
+        Serial.println("Voice Command: LIGHT OFF");
+        // digitalWrite(AC_RELAY_PIN, LOW);
+        FastLED.setBrightness(0);
+        FastLED.show();
+      }
+      
+      voice_rx_idx = 0; 
     }
   }
 }
