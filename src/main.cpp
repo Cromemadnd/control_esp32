@@ -38,16 +38,133 @@ struct SensorData
   float battery = 0.0f;     // 储备电池电量
   float current = 0.0f;     // 母线电流
 } sensorData;
+
+// LED Mode Enumeration
 enum LedMode
 {
-  MODE_FLOW,    // 流水灯
-  MODE_COLORFUL // 彩色闪光灯
+  MODE_SOLID = 0,      // 纯色常亮
+  MODE_BREATHING = 1,  // 呼吸灯
+  MODE_SOS = 2,        // SOS闪光
+  MODE_FAST_FLASH = 3, // 快速闪光
+  MODE_FLOW = 4        // 流水灯
 };
 
-LedMode currentMode = MODE_FLOW;
+// LED Strip State Structure
+struct LedStripState
+{
+  LedMode mode = MODE_SOLID;
+  uint8_t brightness = 50; // 0-100%
+  uint32_t colors[8];      // 8个颜色值，未使用的设为0xFFFFFFFF
+  uint8_t colorCount = 1;  // 实际使用的颜色数量
+};
+
+LedStripState ledState;
+
+// System Control State
+struct SystemState
+{
+  bool screenEnabled = true;
+  bool acOutputEnabled = false;
+  uint8_t ledBrightness = 50;
+  LedMode ledMode = MODE_SOLID;
+  uint32_t ledColors[8] = {0xFF0000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF}; // Red as default
+  uint8_t ledColorCount = 1;
+};
+
+SystemState systemState;
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
+
+// 持久化存储相关函数
+const char *STATE_FILE = "/system_state.json";
+
+// 从SPIFFS读取系统状态
+void loadSystemState()
+{
+  if (SPIFFS.exists(STATE_FILE))
+  {
+    Serial.println("Loading system state from SPIFFS...");
+    File file = SPIFFS.open(STATE_FILE, "r");
+    if (file)
+    {
+      StaticJsonDocument<512> doc;
+      DeserializationError err = deserializeJson(doc, file);
+      file.close();
+
+      if (!err)
+      {
+        systemState.screenEnabled = doc["screenEnabled"] | true;
+        systemState.acOutputEnabled = doc["acOutputEnabled"] | false;
+        systemState.ledBrightness = doc["ledBrightness"] | 50;
+        systemState.ledMode = (LedMode)(doc["ledMode"] | 0);
+        systemState.ledColorCount = doc["ledColorCount"] | 1;
+
+        // 读取颜色数组
+        JsonArray colorArray = doc["ledColors"];
+        if (colorArray)
+        {
+          for (uint8_t i = 0; i < 8; i++)
+          {
+            systemState.ledColors[i] = colorArray[i] | 0xFF0000;
+          }
+        }
+
+        Serial.print("System state loaded: brightness=");
+        Serial.print(systemState.ledBrightness);
+        Serial.print(", mode=");
+        Serial.print(systemState.ledMode);
+        Serial.print(", colors=");
+        Serial.println(systemState.ledColorCount);
+      }
+      else
+      {
+        Serial.print("JSON parse error: ");
+        Serial.println(err.c_str());
+      }
+    }
+    else
+    {
+      Serial.println("Failed to open state file");
+    }
+  }
+  else
+  {
+    Serial.println("No state file found, using default settings");
+  }
+}
+
+// 保存系统状态到SPIFFS
+void saveSystemState()
+{
+  StaticJsonDocument<512> doc;
+  doc["screenEnabled"] = systemState.screenEnabled;
+  doc["acOutputEnabled"] = systemState.acOutputEnabled;
+  doc["ledBrightness"] = systemState.ledBrightness;
+  doc["ledMode"] = systemState.ledMode;
+  doc["ledColorCount"] = systemState.ledColorCount;
+
+  // 保存颜色数组
+  JsonArray colorArray = doc.createNestedArray("ledColors");
+  for (uint8_t i = 0; i < 8; i++)
+  {
+    colorArray.add(systemState.ledColors[i]);
+  }
+
+  File file = SPIFFS.open(STATE_FILE, "w");
+  if (file)
+  {
+    size_t bytesWritten = serializeJson(doc, file);
+    file.close();
+    Serial.print("System state saved: ");
+    Serial.print(bytesWritten);
+    Serial.println(" bytes");
+  }
+  else
+  {
+    Serial.println("Failed to open state file for writing");
+  }
+}
 
 void sendJson(AsyncWebSocketClient *client, const JsonDocument &doc)
 {
@@ -61,6 +178,225 @@ void broadcastJson(const JsonDocument &doc)
   String payload;
   serializeJson(doc, payload);
   ws.textAll(payload);
+}
+
+// 创建系统状态同步消息
+void sendSystemStateSyncJson(AsyncWebSocketClient *client)
+{
+  StaticJsonDocument<512> doc;
+  doc["event"] = "state_sync";
+  doc["screen"] = systemState.screenEnabled;
+  doc["ac_output"] = systemState.acOutputEnabled;
+  doc["brightness"] = systemState.ledBrightness;
+  doc["led_mode"] = (int)systemState.ledMode;
+  doc["color_count"] = systemState.ledColorCount;
+
+  JsonArray colors = doc.createNestedArray("colors");
+  for (uint8_t i = 0; i < 8; i++)
+  {
+    colors.add(systemState.ledColors[i]);
+  }
+
+  sendJson(client, doc);
+}
+
+// 根据电池电量和颜色数组计算当前应显示的颜色
+uint32_t interpolateColor(float batteryPercent)
+{
+  if (systemState.ledColorCount == 0)
+    return 0xFF0000; // 默认红色
+
+  if (systemState.ledColorCount == 1)
+    return systemState.ledColors[0];
+
+  // 将电池百分比分段到颜色数组
+  // 例如：3个颜色对应 100%, 50%, 0%
+  float normalizedBattery = batteryPercent / 100.0f;
+  float segmentSize = 1.0f / (systemState.ledColorCount - 1);
+  int lowIdx = (int)(normalizedBattery / segmentSize);
+  int highIdx = lowIdx + 1;
+
+  if (lowIdx >= systemState.ledColorCount - 1)
+    return systemState.ledColors[systemState.ledColorCount - 1];
+
+  if (lowIdx < 0)
+    lowIdx = 0;
+  if (highIdx >= systemState.ledColorCount)
+    highIdx = systemState.ledColorCount - 1;
+
+  // 计算插值系数
+  float localPercent = (normalizedBattery - lowIdx * segmentSize) / segmentSize;
+
+  // 解析RGB颜色
+  uint32_t lowColor = systemState.ledColors[lowIdx];
+  uint32_t highColor = systemState.ledColors[highIdx];
+
+  uint8_t lowR = (lowColor >> 16) & 0xFF;
+  uint8_t lowG = (lowColor >> 8) & 0xFF;
+  uint8_t lowB = lowColor & 0xFF;
+
+  uint8_t highR = (highColor >> 16) & 0xFF;
+  uint8_t highG = (highColor >> 8) & 0xFF;
+  uint8_t highB = highColor & 0xFF;
+
+  // 线性插值
+  uint8_t r = lowR + (highR - lowR) * localPercent;
+  uint8_t g = lowG + (highG - lowG) * localPercent;
+  uint8_t b = lowB + (highB - lowB) * localPercent;
+
+  return (r << 16) | (g << 8) | b;
+}
+
+// 更新LED显示（根据当前模式）
+void updateLedDisplay()
+{
+  uint8_t brightness = map(systemState.ledBrightness, 0, 100, 0, 255);
+  FastLED.setBrightness(brightness);
+
+  uint32_t currentColor = interpolateColor(sensorData.battery * 100.0f);
+
+  switch (systemState.ledMode)
+  {
+  case MODE_SOLID:
+  {
+    // 纯色常亮
+    uint8_t r = (currentColor >> 16) & 0xFF;
+    uint8_t g = (currentColor >> 8) & 0xFF;
+    uint8_t b = currentColor & 0xFF;
+    for (int i = 0; i < LED_COUNT; i++)
+    {
+      leds[i] = CRGB(r, g, b);
+    }
+    FastLED.show();
+    break;
+  }
+  case MODE_BREATHING:
+  {
+    // 呼吸灯效果
+    static unsigned long lastBreath = 0;
+    static uint8_t breathBrightness = 0;
+    static int8_t breathDirection = 1;
+
+    if (millis() - lastBreath > 30) // 每30ms更新一次
+    {
+      lastBreath = millis();
+
+      uint8_t r = (currentColor >> 16) & 0xFF;
+      uint8_t g = (currentColor >> 8) & 0xFF;
+      uint8_t b = currentColor & 0xFF;
+
+      for (int i = 0; i < LED_COUNT; i++)
+      {
+        leds[i] = CRGB(r, g, b);
+        leds[i] %= (breathBrightness); // 调节亮度
+      }
+
+      breathBrightness += breathDirection * 5;
+      if (breathBrightness >= 255)
+      {
+        breathBrightness = 255;
+        breathDirection = -1;
+      }
+      else if (breathBrightness <= 50)
+      {
+        breathBrightness = 50;
+        breathDirection = 1;
+      }
+
+      FastLED.show();
+    }
+    break;
+  }
+  case MODE_SOS:
+  {
+    // SOS闪光 (三短0.1s 三长0.3s 三短0.1s)
+    static unsigned long sosCycle = 0;
+    static unsigned long sosStart = 0;
+    bool sosLedOn = false;
+
+    if (millis() - sosStart > 2400) // 2.4秒一个周期
+    {
+      sosStart = millis();
+      sosCycle = 0;
+    }
+
+    unsigned long elapsed = millis() - sosStart;
+
+    // S (三个短闪 0.1s 间隔)
+    if ((elapsed < 100) || (elapsed >= 200 && elapsed < 300) || (elapsed >= 400 && elapsed < 500))
+      sosLedOn = true;
+    // O (三个长闪 0.3s 间隔)
+    else if ((elapsed >= 600 && elapsed < 900) || (elapsed >= 1100 && elapsed < 1400) || (elapsed >= 1600 && elapsed < 1900))
+      sosLedOn = true;
+    // S (三个短闪 0.1s 间隔)
+    else if ((elapsed >= 2000 && elapsed < 2100) || (elapsed >= 2200 && elapsed < 2300))
+      sosLedOn = true;
+
+    uint8_t r = (currentColor >> 16) & 0xFF;
+    uint8_t g = (currentColor >> 8) & 0xFF;
+    uint8_t b = currentColor & 0xFF;
+
+    for (int i = 0; i < LED_COUNT; i++)
+    {
+      leds[i] = sosLedOn ? CRGB(r, g, b) : CRGB::Black;
+    }
+    FastLED.show();
+    break;
+  }
+  case MODE_FAST_FLASH:
+  {
+    // 快速闪光 (周期0.2s)
+    static unsigned long lastFlash = 0;
+    static bool flashOn = true;
+
+    if (millis() - lastFlash > 100) // 每100ms切换
+    {
+      lastFlash = millis();
+      flashOn = !flashOn;
+    }
+
+    uint8_t r = (currentColor >> 16) & 0xFF;
+    uint8_t g = (currentColor >> 8) & 0xFF;
+    uint8_t b = currentColor & 0xFF;
+
+    for (int i = 0; i < LED_COUNT; i++)
+    {
+      leds[i] = flashOn ? CRGB(r, g, b) : CRGB::Black;
+    }
+    FastLED.show();
+    break;
+  }
+  case MODE_FLOW:
+  {
+    // 流水灯效果
+    static unsigned long lastFlow = 0;
+    static uint8_t flowPosition = 0;
+
+    if (millis() - lastFlow > 50) // 每50ms移动一步
+    {
+      lastFlow = millis();
+
+      FastLED.clear();
+
+      uint8_t r = (currentColor >> 16) & 0xFF;
+      uint8_t g = (currentColor >> 8) & 0xFF;
+      uint8_t b = currentColor & 0xFF;
+
+      // 显示5个LED的流水效果
+      for (int i = 0; i < 5; i++)
+      {
+        int pos = (flowPosition + i) % LED_COUNT;
+        uint8_t brightness = 255 - (i * 50);
+        leds[pos] = CRGB(r, g, b);
+        leds[pos] %= brightness;
+      }
+
+      FastLED.show();
+      flowPosition = (flowPosition + 1) % LED_COUNT;
+    }
+    break;
+  }
+  }
 }
 
 // OLED Display Update Function
@@ -110,15 +446,18 @@ void handleWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
 {
   if (type == WS_EVT_CONNECT)
   {
-    StaticJsonDocument<128> doc;
-    doc["event"] = "connected";
-    doc["clientId"] = static_cast<uint32_t>(client->id());
-    sendJson(client, doc);
+    Serial.print("WebSocket client connected, ID: ");
+    Serial.println(client->id());
+
+    // 向新连接的客户端发送当前系统状态
+    sendSystemStateSyncJson(client);
     return;
   }
 
   if (type == WS_EVT_DISCONNECT)
   {
+    Serial.print("WebSocket client disconnected, ID: ");
+    Serial.println(client->id());
     return;
   }
 
@@ -137,7 +476,7 @@ void handleWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
       msg += static_cast<char>(data[i]);
     }
 
-    StaticJsonDocument<512> doc;
+    StaticJsonDocument<1024> doc;
     DeserializationError err = deserializeJson(doc, msg);
     if (err)
     {
@@ -150,9 +489,7 @@ void handleWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
 
     const char *cmd = doc["cmd"] | "echo";
     bool broadcast = doc["broadcast"] | false;
-    const char *text = doc["msg"] | "";
 
-    // 通过串口打印收到的JSON数据
     Serial.print("Received command: ");
     Serial.println(cmd);
 
@@ -177,11 +514,11 @@ void handleWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
         if (strcmp(target, "screen") == 0)
         {
           bool value = doc["value"] | false;
+          systemState.screenEnabled = value;
           reply["value"] = value;
           Serial.print("Screen control: ");
           Serial.println(value ? "ON" : "OFF");
 
-          // 控制 OLED 显示屏
           if (value)
           {
             display.oled_command(SH110X_DISPLAYON);
@@ -190,47 +527,81 @@ void handleWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
           {
             display.oled_command(SH110X_DISPLAYOFF);
           }
+
+          saveSystemState(); // 保存状态
         }
         else if (strcmp(target, "ac_output") == 0)
         {
           bool value = doc["value"] | false;
+          systemState.acOutputEnabled = value;
           reply["value"] = value;
           Serial.print("AC output control: ");
           Serial.println(value ? "ON" : "OFF");
-          // 写入GPIO控制继电器
           digitalWrite(AC_RELAY_PIN, value ? HIGH : LOW);
+
+          saveSystemState(); // 保存状态
         }
         else if (strcmp(target, "brightness") == 0)
         {
           int value = doc["value"] | 50;
+          value = constrain(value, 0, 100);
+          systemState.ledBrightness = value;
           reply["value"] = value;
           Serial.print("Brightness: ");
           Serial.println(value);
+          updateLedDisplay(); // 立即更新LED显示
 
-          // 设置 FastLED 亮度 (0-100 转换为 0-255)
-          uint8_t brightness = map(value, 0, 100, 0, 255);
-          FastLED.setBrightness(brightness);
-          FastLED.show();
+          saveSystemState(); // 保存状态
         }
         else if (strcmp(target, "led_mode") == 0)
         {
           int mode = doc["value"] | 0;
-          if (mode == 0)
+          if (mode >= 0 && mode <= 4)
           {
-            currentMode = MODE_FLOW;
-            reply["value"] = "flow";
-            Serial.println("LED Mode: FLOW");
-          }
-          else if (mode == 1)
-          {
-            currentMode = MODE_COLORFUL;
-            reply["value"] = "colorful";
-            Serial.println("LED Mode: COLORFUL");
+            systemState.ledMode = (LedMode)mode;
+            reply["value"] = mode;
+            Serial.print("LED Mode: ");
+            Serial.println(mode);
+
+            saveSystemState(); // 保存状态
           }
           else
           {
             reply["ok"] = false;
             reply["error"] = "invalid_mode";
+          }
+        }
+        else if (strcmp(target, "colors") == 0)
+        {
+          // 设置灯条颜色数组
+          JsonArray colorArray = doc["colors"];
+          if (colorArray)
+          {
+            systemState.ledColorCount = min((uint8_t)colorArray.size(), (uint8_t)8);
+            for (uint8_t i = 0; i < systemState.ledColorCount; i++)
+            {
+              systemState.ledColors[i] = colorArray[i] | 0xFF0000;
+            }
+            // 填充未使用的颜色为0xFFFFFFFF
+            for (uint8_t i = systemState.ledColorCount; i < 8; i++)
+            {
+              systemState.ledColors[i] = 0xFFFFFFFF;
+            }
+
+            JsonArray replyColors = reply.createNestedArray("colors");
+            for (uint8_t i = 0; i < 8; i++)
+            {
+              replyColors.add(systemState.ledColors[i]);
+            }
+            reply["color_count"] = systemState.ledColorCount;
+            Serial.print("Colors updated, count: ");
+            Serial.println(systemState.ledColorCount);
+            updateLedDisplay(); // 立即更新LED显示
+          }
+          else
+          {
+            reply["ok"] = false;
+            reply["error"] = "missing_colors";
           }
         }
         else
@@ -247,8 +618,8 @@ void handleWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
     }
     else
     {
-      // 其他命令保留 msg 字段
-      reply["msg"] = text;
+      reply["ok"] = false;
+      reply["error"] = "unknown_command";
     }
 
     if (broadcast)
@@ -321,25 +692,18 @@ void setup()
   // Initialize FastLED Strip
   Serial.println("Initializing LED strip...");
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, LED_COUNT);
-  FastLED.setBrightness(255); // 先用最大亮度测试
+  FastLED.setBrightness(LED_BRIGHTNESS);
 
-  // Set all LEDs to green
-  Serial.println("Setting LEDs to green...");
-  for (int i = 0; i < LED_COUNT; i++)
-  {
-    leds[i] = CRGB::Green;
-  }
-  FastLED.show(); // Display the colors
+  // Set all LEDs to initial state
+  Serial.println("Setting LEDs to initial state...");
+  updateLedDisplay();
   Serial.println("LED strip initialized!");
 }
 
 void loop()
 {
-  // LED Effects
-  static unsigned long lastUpdate = 0;
-  static unsigned long lastOLEDUpdate = 0; // For OLED refresh
-  static uint8_t flowPosition = 0;
-  static uint8_t colorIndex = 0;
+  // LED Effects and OLED Updates
+  static unsigned long lastOLEDUpdate = 0;
 
   // Update OLED display every 500ms to reduce I2C traffic
   if (millis() - lastOLEDUpdate > 500)
@@ -348,52 +712,13 @@ void loop()
     updateOLEDDisplay();
   }
 
-  if (currentMode == MODE_FLOW)
-  {
-    // 流水灯效果
-    if (millis() - lastUpdate > 50) // Update every 50ms
-    {
-      lastUpdate = millis();
-
-      // Clear all LEDs
-      FastLED.clear();
-
-      // Light up 5 consecutive LEDs with a gradient
-      for (int i = 0; i < 5; i++)
-      {
-        int pos = (flowPosition + i) % LED_COUNT;
-        uint8_t brightness = 255 - (i * 50);    // Gradient tail
-        leds[pos] = CHSV(160, 255, brightness); // Cyan color
-      }
-
-      FastLED.show();
-      flowPosition = (flowPosition + 1) % LED_COUNT;
-    }
-  }
-  else if (currentMode == MODE_COLORFUL)
-  {
-    // 彩色闪光灯效果
-    if (millis() - lastUpdate > 200) // Update every 200ms
-    {
-      lastUpdate = millis();
-
-      // Random colorful flashing
-      for (int i = 0; i < LED_COUNT; i++)
-      {
-        // Use different hues for each LED
-        uint8_t hue = (colorIndex + (i * 10)) % 255;
-        leds[i] = CHSV(hue, 255, 255);
-      }
-
-      FastLED.show();
-      colorIndex += 20; // Shift color pattern
-    }
-  }
+  // Update LED display based on current mode
+  updateLedDisplay();
 
   // Clean up disconnected WebSocket clients periodically
   ws.cleanupClients();
 
-  // UART Parsing
+  // UART Parsing for sensor data from STM32
   static uint8_t rx_buffer[32];
   static int rx_idx = 0;
 
@@ -442,7 +767,7 @@ void loop()
           sensorData.battery = values[3];
           sensorData.current = values[4];
 
-          StaticJsonDocument<512> doc;
+          StaticJsonDocument<256> doc;
           doc["voltage"] = sensorData.voltage;
           doc["ac_voltage"] = sensorData.ac_voltage;
           doc["temperature"] = sensorData.temperature;

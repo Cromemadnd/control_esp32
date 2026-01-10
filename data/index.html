@@ -111,6 +111,49 @@
                             oninput="updateBrightnessUI(this.value)"
                             onchange="sendControl('brightness', parseInt(this.value))">
                     </div>
+
+                    <!-- 灯条模式选择 -->
+                    <div class="space-y-3">
+                        <div class="flex justify-between items-center">
+                            <span class="text-sm text-slate-400">灯条模式</span>
+                        </div>
+                        <div class="grid grid-cols-2 gap-2">
+                            <button onclick="sendControl('led_mode', 0)"
+                                class="px-3 py-2 rounded-lg text-xs bg-slate-700 hover:bg-slate-600 transition"
+                                id="btn-mode-solid">纯色常亮</button>
+                            <button onclick="sendControl('led_mode', 1)"
+                                class="px-3 py-2 rounded-lg text-xs bg-slate-700 hover:bg-slate-600 transition"
+                                id="btn-mode-breathing">呼吸灯</button>
+                            <button onclick="sendControl('led_mode', 2)"
+                                class="px-3 py-2 rounded-lg text-xs bg-slate-700 hover:bg-slate-600 transition"
+                                id="btn-mode-sos">SOS闪光</button>
+                            <button onclick="sendControl('led_mode', 3)"
+                                class="px-3 py-2 rounded-lg text-xs bg-slate-700 hover:bg-slate-600 transition"
+                                id="btn-mode-flash">快速闪光</button>
+                            <button onclick="sendControl('led_mode', 4)"
+                                class="px-3 py-2 rounded-lg text-xs bg-slate-700 hover:bg-slate-600 transition col-span-2"
+                                id="btn-mode-flow">流水灯</button>
+                        </div>
+                    </div>
+
+                    <!-- 灯条颜色调节 -->
+                    <div class="space-y-3">
+                        <div class="flex justify-between items-center">
+                            <span class="text-sm text-slate-400">灯条颜色</span>
+                            <span id="color-count-text" class="text-xs font-mono text-emerald-400">1个</span>
+                        </div>
+                        <div id="color-palette" class="space-y-2">
+                            <!-- 动态添加颜色选择器 -->
+                        </div>
+                        <div class="flex gap-2">
+                            <button onclick="addColorPalette()"
+                                class="flex-1 px-2 py-2 rounded-lg text-xs bg-emerald-600 hover:bg-emerald-500 transition">+
+                                添加</button>
+                            <button onclick="removeColorPalette()"
+                                class="flex-1 px-2 py-2 rounded-lg text-xs bg-red-600 hover:bg-red-500 transition">-
+                                删除</button>
+                        </div>
+                    </div>
                 </div>
             </div>
 
@@ -190,11 +233,124 @@
         let socket = null;
         let reconnectTimer = null;
 
+        // 系统状态存储
+        let systemState = {
+            screen: true,
+            ac_output: false,
+            brightness: 50,
+            led_mode: 0,
+            color_count: 1,
+            colors: [0xFF0000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF]
+        };
+
+        // LED模式标签
+        const LED_MODE_NAMES = ['纯色常亮', '呼吸灯', 'SOS闪光', '快速闪光', '流水灯'];
+
         const ICONS = {
             check: '<svg class="w-4 h-4 text-emerald-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>',
             refresh: '<svg class="w-4 h-4 text-blue-500 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>',
             alert: '<svg class="w-4 h-4 text-red-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/></svg>'
         };
+
+        // 颜色转换函数
+        function uint32ToHex(num) {
+            if (num === 0xFFFFFFFF) return '#FF0000';
+            return '#' + ('000000' + num.toString(16).toUpperCase()).slice(-6);
+        }
+
+        function hexToUint32(hex) {
+            return parseInt(hex.substring(1), 16);
+        }
+
+        // 初始化颜色调色板UI
+        function initColorPalette() {
+            const paletteDiv = document.getElementById('color-palette');
+            paletteDiv.innerHTML = '';
+
+            for (let i = 0; i < systemState.color_count; i++) {
+                // 计算该颜色对应的电量百分比
+                let batteryPercent = 0;
+                if (systemState.color_count === 1) {
+                    batteryPercent = 100;
+                } else {
+                    batteryPercent = Math.round((i / (systemState.color_count - 1)) * 100);
+                }
+
+                const colorDiv = document.createElement('div');
+                colorDiv.className = 'flex items-center justify-between gap-3 p-2 bg-slate-700/30 rounded-lg';
+                colorDiv.innerHTML = `
+                    <div class="flex items-center gap-2 flex-1">
+                        <input type="color" id="color-${i}" value="${uint32ToHex(systemState.colors[i])}" 
+                            class="w-10 h-10 rounded cursor-pointer" 
+                            onchange="updateColor(${i}, this.value)">
+                        <span class="text-xs text-slate-400">颜色${i + 1}</span>
+                    </div>
+                    <span class="text-xs font-mono text-emerald-400 min-w-[3rem] text-right">${batteryPercent}%</span>
+                `;
+                paletteDiv.appendChild(colorDiv);
+            }
+
+            document.getElementById('color-count-text').innerText = `${systemState.color_count}个`;
+        }
+
+        // 更新颜色
+        function updateColor(index, hexColor) {
+            systemState.colors[index] = hexToUint32(hexColor);
+            applyColors();
+        }
+
+        // 添加颜色调色板
+        function addColorPalette() {
+            if (systemState.color_count < 8) {
+                systemState.color_count++;
+                if (systemState.color_count > 1) {
+                    systemState.colors[systemState.color_count - 1] = 0xFF0000;
+                }
+                initColorPalette();
+                applyColors();
+            }
+        }
+
+        // 删除颜色调色板
+        function removeColorPalette() {
+            if (systemState.color_count > 1) {
+                systemState.color_count--;
+                initColorPalette();
+                applyColors();
+            }
+        }
+
+        // 应用颜色设置到设备
+        function applyColors() {
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                const colors = [];
+                for (let i = 0; i < systemState.color_count; i++) {
+                    colors.push(systemState.colors[i]);
+                }
+
+                const payload = {
+                    cmd: "control",
+                    target: "colors",
+                    colors: colors
+                };
+                socket.send(JSON.stringify(payload));
+                console.log("Sent colors:", payload);
+            }
+        }
+
+        // 更新LED模式按钮样式
+        function updateLedModeButtons() {
+            for (let i = 0; i < 5; i++) {
+                const btn = document.getElementById(`btn-mode-${['solid', 'breathing', 'sos', 'flash', 'flow'][i]}`);
+                if (i === systemState.led_mode) {
+                    btn.classList.add('bg-blue-600', 'text-white');
+                    btn.classList.remove('bg-slate-700');
+                } else {
+                    btn.classList.remove('bg-blue-600', 'text-white');
+                    btn.classList.add('bg-slate-700');
+                }
+            }
+        }
 
         function setStatus(type, text) {
             document.getElementById('status-text').innerText = text;
@@ -214,6 +370,7 @@
         // 更新亮度 UI 文字（不涉及网络发送）
         function updateBrightnessUI(val) {
             document.getElementById('val-brightness-text').innerText = `${val}%`;
+            systemState.brightness = parseInt(val);
         }
 
         // 发送控制指令
@@ -226,6 +383,22 @@
                 };
                 socket.send(JSON.stringify(payload));
                 console.log("Sent command:", payload);
+
+                // 更新本地状态
+                if (target === 'screen') {
+                    systemState.screen = value;
+                    document.getElementById('ctrl-screen').checked = value;
+                } else if (target === 'ac_output') {
+                    systemState.ac_output = value;
+                    document.getElementById('ctrl-ac-out').checked = value;
+                } else if (target === 'brightness') {
+                    systemState.brightness = value;
+                    document.getElementById('ctrl-brightness').value = value;
+                    updateBrightnessUI(value);
+                } else if (target === 'led_mode') {
+                    systemState.led_mode = value;
+                    updateLedModeButtons();
+                }
             } else {
                 console.warn("WebSocket is not connected. Command ignored.");
             }
@@ -258,6 +431,16 @@
             lastUpdate.classList.remove('hidden');
         }
 
+        // 同步系统状态到UI
+        function syncSystemStateToUI() {
+            document.getElementById('ctrl-screen').checked = systemState.screen;
+            document.getElementById('ctrl-ac-out').checked = systemState.ac_output;
+            document.getElementById('ctrl-brightness').value = systemState.brightness;
+            document.getElementById('val-brightness-text').innerText = `${systemState.brightness}%`;
+            updateLedModeButtons();
+            initColorPalette();
+        }
+
         function connect() {
             if (reconnectTimer) clearTimeout(reconnectTimer);
             const url = `${protocol}://192.168.4.1/ws`;
@@ -267,12 +450,28 @@
 
             try {
                 socket = new WebSocket(url);
-                socket.onopen = () => setStatus('connected', '已连接');
+                socket.onopen = () => {
+                    setStatus('connected', '已连接');
+                };
                 socket.onmessage = (event) => {
                     try {
                         const data = JSON.parse(event.data);
+
+                        // 系统状态同步
+                        if (data.event === 'state_sync') {
+                            console.log('State sync received:', data);
+                            systemState.screen = data.screen;
+                            systemState.ac_output = data.ac_output;
+                            systemState.brightness = data.brightness;
+                            systemState.led_mode = data.led_mode;
+                            systemState.color_count = data.color_count;
+                            if (data.colors) {
+                                systemState.colors = data.colors;
+                            }
+                            syncSystemStateToUI();
+                        }
                         // 传感器数据更新
-                        if (data.voltage !== undefined) {
+                        else if (data.voltage !== undefined) {
                             updateUI(data);
                         }
                         // 控制命令响应
@@ -281,10 +480,6 @@
                             if (!data.ok) {
                                 console.warn('Control command failed:', data);
                             }
-                        }
-                        // 连接确认
-                        else if (data.event === 'connected') {
-                            console.log('Connected with client ID:', data.clientId);
                         }
                     } catch (e) {
                         console.error('Failed to parse message:', e);
@@ -304,7 +499,10 @@
             }
         }
 
-        window.addEventListener('load', connect);
+        window.addEventListener('load', () => {
+            initColorPalette();
+            connect();
+        });
     </script>
 </body>
 
