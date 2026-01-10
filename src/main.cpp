@@ -19,7 +19,7 @@ constexpr const char *kApPassword = "portablepower123";
 #define LED_BRIGHTNESS 50 // 初始亮度 (0-255)
 #define AC_RELAY_PIN 14   // 交流输出继电器控制引脚
 #define VOICE_RX_PIN 4    // 语音模块 RX 引脚 (ESP32 的 RX，接模块的 TX)
-
+#define VOICE_TX_PIN 5    // 语音模块 TX 引脚 (ESP32 的 TX，接模块的 RX)
 
 CRGB leds[LED_COUNT];
 
@@ -200,6 +200,42 @@ void sendSystemStateSyncJson(AsyncWebSocketClient *client)
   }
 
   sendJson(client, doc);
+}
+
+// 广播系统状态到所有 WebSocket 客户端
+void broadcastSystemStateSync()
+{
+  StaticJsonDocument<512> doc;
+  doc["event"] = "state_sync";
+  doc["screen"] = systemState.screenEnabled;
+  doc["ac_output"] = systemState.acOutputEnabled;
+  doc["brightness"] = systemState.ledBrightness;
+  doc["led_mode"] = (int)systemState.ledMode;
+  doc["color_count"] = systemState.ledColorCount;
+
+  JsonArray colors = doc.createNestedArray("colors");
+  for (uint8_t i = 0; i < 8; i++)
+  {
+    colors.add(systemState.ledColors[i]);
+  }
+
+  broadcastJson(doc);
+}
+
+// 发送命令到语音模块
+// 协议: 0xAA 0x00 func data
+void sendVoiceModuleCommand(uint8_t func, uint8_t dataByte)
+{
+  Serial1.write(0xAA);
+  Serial1.write(0x00);
+  Serial1.write(func);
+  Serial1.write(dataByte);
+  Serial1.flush();
+
+  Serial.print("Sent to Voice Module - Func: 0x");
+  Serial.print(func, HEX);
+  Serial.print(", Data: 0x");
+  Serial.println(dataByte, HEX);
 }
 
 // 根据电池电量和颜色数组计算当前应显示的颜色
@@ -673,11 +709,13 @@ void setup()
   // RX: 16, TX: 17, 115200 bps
   Serial2.begin(115200, SERIAL_8N1, 16, 17);
 
-  // 初始化语音模块串口 (Serial1)
-  // RX: 4, TX: -1 (不使用), 波特率通常为 9600 (请根据模块实际情况调整)
-  Serial1.begin(9600, SERIAL_8N1, VOICE_RX_PIN, -1);
-  Serial.println("Voice Module Serial1 initialized on Pin 4");
-
+  // 初始化语音模块串口 (Serial1) - 双向通信
+  // RX: GPIO 4, TX: GPIO 5, 波特率: 9600
+  Serial1.begin(9600, SERIAL_8N1, VOICE_RX_PIN, VOICE_TX_PIN);
+  Serial.print("Voice Module Serial1 initialized - RX Pin: ");
+  Serial.print(VOICE_RX_PIN);
+  Serial.print(", TX Pin: ");
+  Serial.println(VOICE_TX_PIN);
 
   // Initialize I2C and OLED Display
   Serial.println("Initializing OLED display...");
@@ -797,57 +835,127 @@ void loop()
   }
 
   // -------------------------
-  // 语音模块数据处理
-  // 协议: 头(FF 1F) + 指令 + 校验/数据
-  // 开灯: FF 1F 34 AA
-  // 关灯: FF 1F 34 BB
+  // 语音模块数据处理（新协议）
+  // 协议: 0xAA 0x00 功能码 数据(1字节)
+  // 功能码: 0x01(开关灯), 0x02(逆变电源控制), 0x03(屏幕控制)
+  // 数据:
+  //   灯:   开 0x15, 关 0x20
+  //   逆变: 开 0x25, 关 0x30
+  //   屏幕: 开 0x35, 关 0x40
   // -------------------------
   while (Serial1.available())
   {
     static uint8_t voice_rx_buffer[4];
     static int voice_rx_idx = 0;
-    
+
     uint8_t c = Serial1.read();
 
-    // 简单的协议检测状态机
-    if (voice_rx_idx == 0) {
-      if (c == 0xFF) {
+    // 状态机解析 0xAA 0x00 func data
+    if (voice_rx_idx == 0)
+    {
+      if (c == 0xAA)
+      {
         voice_rx_buffer[voice_rx_idx++] = c;
       }
     }
-    else if (voice_rx_idx == 1) {
-      if (c == 0x1F) {
+    else if (voice_rx_idx == 1)
+    {
+      if (c == 0x00)
+      {
         voice_rx_buffer[voice_rx_idx++] = c;
-      } else {
-        voice_rx_idx = 0; 
-        if (c == 0xFF) voice_rx_idx = 1; 
+      }
+      else
+      {
+        voice_rx_idx = 0;
+        if (c == 0xAA)
+          voice_rx_idx = 1;
       }
     }
-    else if (voice_rx_idx == 2) {
-      if (c == 0x34) {
-        voice_rx_buffer[voice_rx_idx++] = c;
-      } else {
-         voice_rx_idx = 0;
-      }
+    else if (voice_rx_idx == 2)
+    {
+      // 功能码
+      voice_rx_buffer[voice_rx_idx++] = c;
     }
-    else if (voice_rx_idx == 3) {
-      voice_rx_buffer[voice_rx_idx] = c;
-      
-      // 检测指令
-      if (c == 0xAA) {
-        Serial.println("Voice Command: LIGHT ON");
-        // digitalWrite(AC_RELAY_PIN, HIGH);
-        FastLED.setBrightness(255);
-        FastLED.show();
+    else if (voice_rx_idx == 3)
+    {
+      // 数据
+      voice_rx_buffer[voice_rx_idx++] = c;
+
+      uint8_t func = voice_rx_buffer[2];
+      uint8_t dataByte = voice_rx_buffer[3];
+
+      // 处理命令
+      switch (func)
+      {
+      case 0x01: // 开关灯
+        if (dataByte == 0x15)
+        {
+          Serial.println("Voice: LIGHT ON");
+          systemState.ledBrightness = 100;
+          updateLedDisplay();
+          saveSystemState();
+          broadcastSystemStateSync();
+        }
+        else if (dataByte == 0x20)
+        {
+          Serial.println("Voice: LIGHT OFF");
+          systemState.ledBrightness = 0;
+          updateLedDisplay();
+          saveSystemState();
+          broadcastSystemStateSync();
+        }
+        break;
+
+      case 0x02: // 逆变电源控制（继电器）
+        if (dataByte == 0x25)
+        {
+          Serial.println("Voice: INVERTER ON");
+          systemState.acOutputEnabled = true;
+          digitalWrite(AC_RELAY_PIN, HIGH);
+          saveSystemState();
+          broadcastSystemStateSync();
+        }
+        else if (dataByte == 0x30)
+        {
+          Serial.println("Voice: INVERTER OFF");
+          systemState.acOutputEnabled = false;
+          digitalWrite(AC_RELAY_PIN, LOW);
+          saveSystemState();
+          broadcastSystemStateSync();
+        }
+        else
+        {
+          // 其他数据保留（如电量播报的占位，不处理）
+        }
+        break;
+
+      case 0x03: // 屏幕控制
+        if (dataByte == 0x35)
+        {
+          Serial.println("Voice: SCREEN ON");
+          systemState.screenEnabled = true;
+          display.oled_command(SH110X_DISPLAYON);
+          saveSystemState();
+          broadcastSystemStateSync();
+        }
+        else if (dataByte == 0x40)
+        {
+          Serial.println("Voice: SCREEN OFF");
+          systemState.screenEnabled = false;
+          display.oled_command(SH110X_DISPLAYOFF);
+          saveSystemState();
+          broadcastSystemStateSync();
+        }
+        break;
+
+      default:
+        Serial.print("Voice: Unknown func ");
+        Serial.println(func, HEX);
+        break;
       }
-      else if (c == 0xBB) {
-        Serial.println("Voice Command: LIGHT OFF");
-        // digitalWrite(AC_RELAY_PIN, LOW);
-        FastLED.setBrightness(0);
-        FastLED.show();
-      }
-      
-      voice_rx_idx = 0; 
+
+      // 重置解析
+      voice_rx_idx = 0;
     }
   }
 }
