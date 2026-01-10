@@ -37,7 +37,7 @@ struct SensorData
   float voltage = 0.0f;     // 稳压反馈电压
   float ac_voltage = 0.0f;  // 市电电压
   float temperature = 0.0f; // 环境温度
-  float battery = 0.0f;     // 储备电池电量
+  float battery = 0.73f;    // 储备电池电量 (0.0-1.0, 73%)
   float current = 0.0f;     // 母线电流
 } sensorData;
 
@@ -835,13 +835,13 @@ void loop()
   }
 
   // -------------------------
-  // 语音模块数据处理（新协议）
-  // 协议: 0xAA 0x00 功能码 数据(1字节)
-  // 功能码: 0x01(开关灯), 0x02(逆变电源控制), 0x03(屏幕控制)
-  // 数据:
-  //   灯:   开 0x15, 关 0x20
-  //   逆变: 开 0x25, 关 0x30
-  //   屏幕: 开 0x35, 关 0x40
+  // 语音模块数据处理
+  // 协议: 0xAA 0x00 功能码 数据(1字节)，共4字节定长帧
+  // 功能码 & 数据对应:
+  //   0x01 0x15 - 开灯    | 0x01 0x20 - 关灯
+  //   0x02 0x25 - 逆变开  | 0x02 0x30 - 逆变关  | 0x02 0x20 - 电量播报请求
+  //   0x03 0x35 - 屏幕开  | 0x03 0x40 - 屏幕关
+  //   0x04 0x60 - 常亮    | 0x04 0x62 - 呼吸    | 0x04 0x65 - SOS | 0x04 0x70 - 快闪
   // -------------------------
   while (Serial1.available())
   {
@@ -906,7 +906,7 @@ void loop()
         }
         break;
 
-      case 0x02: // 逆变电源控制（继电器）
+      case 0x02: // 逆变电源控制 & 电量播报
         if (dataByte == 0x25)
         {
           Serial.println("Voice: INVERTER ON");
@@ -923,9 +923,13 @@ void loop()
           saveSystemState();
           broadcastSystemStateSync();
         }
-        else
+        else if (dataByte == 0x20)
         {
-          // 其他数据保留（如电量播报的占位，不处理）
+          // 电量播报请求 - 返回当前电池电量给语音模块
+          Serial.println("Voice: Battery Report Request");
+          uint8_t batteryPercent = (uint8_t)(sensorData.battery * 100.0f);
+          batteryPercent = constrain(batteryPercent, 0, 100);
+          sendVoiceModuleCommand(0x02, batteryPercent);
         }
         break;
 
@@ -943,6 +947,41 @@ void loop()
           Serial.println("Voice: SCREEN OFF");
           systemState.screenEnabled = false;
           display.oled_command(SH110X_DISPLAYOFF);
+          saveSystemState();
+          broadcastSystemStateSync();
+        }
+        break;
+
+      case 0x04: // 灯效控制
+        if (dataByte == 0x60)
+        {
+          Serial.println("Voice: LED Mode SOLID");
+          systemState.ledMode = MODE_SOLID;
+          updateLedDisplay();
+          saveSystemState();
+          broadcastSystemStateSync();
+        }
+        else if (dataByte == 0x62)
+        {
+          Serial.println("Voice: LED Mode BREATHING");
+          systemState.ledMode = MODE_BREATHING;
+          updateLedDisplay();
+          saveSystemState();
+          broadcastSystemStateSync();
+        }
+        else if (dataByte == 0x65)
+        {
+          Serial.println("Voice: LED Mode SOS");
+          systemState.ledMode = MODE_SOS;
+          updateLedDisplay();
+          saveSystemState();
+          broadcastSystemStateSync();
+        }
+        else if (dataByte == 0x70)
+        {
+          Serial.println("Voice: LED Mode FAST_FLASH");
+          systemState.ledMode = MODE_FAST_FLASH;
+          updateLedDisplay();
           saveSystemState();
           broadcastSystemStateSync();
         }
