@@ -597,6 +597,8 @@ void handleWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
             Serial.print("Colors updated, count: ");
             Serial.println(systemState.ledColorCount);
             updateLedDisplay(); // 立即更新LED显示
+
+            saveSystemState(); // 保存状态
           }
           else
           {
@@ -642,6 +644,9 @@ void setup()
   {
     Serial.println("SPIFFS mount failed");
   }
+
+  // 加载保存的系统状态
+  loadSystemState();
 
   WiFi.mode(WIFI_AP);
   WiFi.softAP(kApSsid, kApPassword);
